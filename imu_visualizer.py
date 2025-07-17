@@ -338,43 +338,169 @@ class SingleIMUVisualizer:
         
         return ani
     
+class DualIMUVisualizer(SingleIMUVisualizer):
+    """Visualize two IMUs (BMI270 and MPU6050) as rods in 3D, with live orientation."""
+    def __init__(self, port=None, baudrate=115200, buffer_size=100):
+        super().__init__(port, baudrate, buffer_size)
+        # Buffers for both IMUs
+        self.imu_buffers = {
+            'BMI270': {'accel': [], 'gyro': [], 'mag': [], 'orientation': {'roll': 0, 'pitch': 0, 'yaw': 0}},
+            'MPU6050': {'accel': [], 'gyro': [], 'orientation': {'roll': 0, 'pitch': 0, 'yaw': 0}}
+        }
+        self.last_time = { 'BMI270': time.time(), 'MPU6050': time.time() }
+
+    def parse_dual_line(self, line):
+        """Parse a line and return (sensor, data_dict) or None."""
+        # BMI270: [BMI270] Accel (X,Y,Z): ... | Gyro (X,Y,Z): ... | Mag (X,Y,Z): ...
+        # MPU6050: [MPU6050] Accel (X,Y,Z): ... | Gyro (X,Y,Z): ...
+        if line.startswith('[BMI270]'):
+            try:
+                parts = line.split('|')
+                accel = [float(x) for x in parts[0].split(':')[1].split(',')]
+                gyro = [float(x) for x in parts[1].split(':')[1].split(',')]
+                mag = [float(x) for x in parts[2].split(':')[1].split(',')]
+                return 'BMI270', {
+                    'accel': {'x': accel[0], 'y': accel[1], 'z': accel[2]},
+                    'gyro': {'x': gyro[0], 'y': gyro[1], 'z': gyro[2]},
+                    'mag': {'x': mag[0], 'y': mag[1], 'z': mag[2]}
+                }
+            except Exception:
+                return None
+        elif line.startswith('[MPU6050]'):
+            try:
+                parts = line.split('|')
+                accel = [float(x) for x in parts[0].split(':')[1].split(',')]
+                gyro = [float(x) for x in parts[1].split(':')[1].split(',')]
+                return 'MPU6050', {
+                    'accel': {'x': accel[0], 'y': accel[1], 'z': accel[2]},
+                    'gyro': {'x': gyro[0], 'y': gyro[1], 'z': gyro[2]}
+                }
+            except Exception:
+                return None
+        return None
+
+    def update_orientation(self, sensor, accel, gyro, dt):
+        # Simple complementary filter for roll/pitch, integrate yaw
+        accel_roll = np.arctan2(accel['y'], accel['z']) * 180 / np.pi
+        accel_pitch = np.arctan2(-accel['x'], np.sqrt(accel['y']**2 + accel['z']**2)) * 180 / np.pi
+        o = self.imu_buffers[sensor]['orientation']
+        gyro_roll = o['roll'] + gyro['x'] * dt
+        gyro_pitch = o['pitch'] + gyro['y'] * dt
+        gyro_yaw = o['yaw'] + gyro['z'] * dt
+        alpha = 0.98
+        o['roll'] = alpha * gyro_roll + (1 - alpha) * accel_roll
+        o['pitch'] = alpha * gyro_pitch + (1 - alpha) * accel_pitch
+        o['yaw'] = gyro_yaw
+
+    def read_data(self):
+        while self.running:
+            try:
+                if self.serial_conn.in_waiting > 0:
+                    line = self.serial_conn.readline().decode('utf-8').strip()
+                    result = self.parse_dual_line(line)
+                    if result:
+                        sensor, data = result
+                        now = time.time()
+                        dt = now - self.last_time[sensor]
+                        self.last_time[sensor] = now
+                        # Store last N
+                        for k in ['accel', 'gyro']:
+                            if k in data:
+                                self.imu_buffers[sensor][k] = data[k]
+                        if 'mag' in data:
+                            self.imu_buffers[sensor]['mag'] = data['mag']
+                        self.update_orientation(sensor, data['accel'], data['gyro'], dt)
+            except Exception:
+                continue
+            time.sleep(0.01)
+
+    def create_visualization(self):
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_title('Dual IMU 3D Rod Visualization')
+        ax.set_xlim(-1, 1)
+        ax.set_ylim(-1, 1)
+        ax.set_zlim(-1, 1)
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+
+        rod_length = 0.8
+        rod_width = 0.05
+
+        def get_rot_matrix(roll, pitch, yaw):
+            # Convert degrees to radians
+            r, p, y = np.deg2rad([roll, pitch, yaw])
+            Rx = np.array([[1,0,0],[0,np.cos(r),-np.sin(r)],[0,np.sin(r),np.cos(r)]])
+            Ry = np.array([[np.cos(p),0,np.sin(p)],[0,1,0],[-np.sin(p),0,np.cos(p)]])
+            Rz = np.array([[np.cos(y),-np.sin(y),0],[np.sin(y),np.cos(y),0],[0,0,1]])
+            return Rz @ Ry @ Rx
+
+        def draw_rod(ax, color, orientation, offset=0):
+            # Draw a rod centered at origin, rotated by orientation
+            rod = np.array([
+                [-rod_length/2, -rod_width, 0],
+                [rod_length/2, -rod_width, 0],
+                [rod_length/2, rod_width, 0],
+                [-rod_length/2, rod_width, 0],
+                [-rod_length/2, -rod_width, 0],
+            ])
+            R = get_rot_matrix(orientation['roll'], orientation['pitch'], orientation['yaw'])
+            rod_rot = (R @ rod.T).T
+            rod_rot[:,2] += offset  # offset in Z for visual separation
+            ax.plot(rod_rot[:,0], rod_rot[:,1], rod_rot[:,2], color=color, linewidth=4)
+            # Draw endpoints
+            ax.scatter(rod_rot[[0,1,2,3],0], rod_rot[[0,1,2,3],1], rod_rot[[0,1,2,3],2], color=color, s=30)
+
+        def animate(frame):
+            ax.cla()
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            ax.set_zlim(-1, 1)
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+            ax.set_title('Dual IMU 3D Rod Visualization')
+            # Draw BMI270 rod (blue, Z=+0.1)
+            draw_rod(ax, 'blue', self.imu_buffers['BMI270']['orientation'], offset=0.1)
+            # Draw MPU6050 rod (red, Z=-0.1)
+            draw_rod(ax, 'red', self.imu_buffers['MPU6050']['orientation'], offset=-0.1)
+            ax.legend(['BMI270 (blue)', 'MPU6050 (red)'])
+
+        ani = animation.FuncAnimation(fig, animate, interval=50, blit=False)
+        plt.show()
+        return ani
+
+# --- Main update ---
 def main():
     parser = argparse.ArgumentParser(description='WearGo IMU Visualizer')
     parser.add_argument('--port', '-p', type=str, help='Serial port (auto-detect if not specified)')
     parser.add_argument('--baudrate', '-b', type=int, default=115200, help='Baud rate (default: 115200)')
     parser.add_argument('--buffer-size', type=int, default=100, help='Data buffer size (default: 100)')
+    parser.add_argument('--dual', action='store_true', help='Visualize both BMI270 and MPU6050 as rods')
     args = parser.parse_args()
-    
-    # Create visualizer
-    visualizer = SingleIMUVisualizer(port=args.port, baudrate=args.baudrate, buffer_size=args.buffer_size)
-    
+
+    if args.dual:
+        visualizer = DualIMUVisualizer(port=args.port, baudrate=args.baudrate, buffer_size=args.buffer_size)
+    else:
+        visualizer = SingleIMUVisualizer(port=args.port, baudrate=args.baudrate, buffer_size=args.buffer_size)
+
     try:
-        # Connect to Arduino
         if not visualizer.connect():
             print("Failed to connect to Arduino")
             return 1
-        
-        # Start reading data
         if not visualizer.start_reading():
             print("Failed to start data reading")
             return 1
-        
         print("Starting visualization... Close the plot window to exit.")
         print("Waiting for data...")
-        
-        # Wait a moment for data to start flowing
         time.sleep(2)
-        
-        # Create and show visualization
         ani = visualizer.create_visualization()
-        
     except KeyboardInterrupt:
         print("\nStopping...")
     finally:
         visualizer.disconnect()
-    
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())
